@@ -1,0 +1,490 @@
+{
+  "name": "Daily AI News Digest to Telegram",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Daily Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        272,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "content": "Daily AI News Digest to Telegram\n\nRuns every morning, reads a small set of AI/tech RSS feeds, normalizes and deduplicates stories, ranks the top 5, asks an LLM to produce a concise digest, and sends one Telegram message. If no strong stories are found, it sends a fallback update instead.",
+        "height": 764,
+        "width": 2360,
+        "color": 5
+      },
+      "id": "sticky-note",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        240,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://openai.com/news/rss.xml",
+        "options": {}
+      },
+      "id": "rss-openai",
+      "name": "Read OpenAI News RSS",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.2,
+      "position": [
+        496,
+        192
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://venturebeat.com/ai/feed/",
+        "options": {}
+      },
+      "id": "rss-vb",
+      "name": "Read VentureBeat AI RSS",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.2,
+      "position": [
+        496,
+        384
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://www.marktechpost.com/feed/",
+        "options": {}
+      },
+      "id": "rss-marktechpost",
+      "name": "Read MarkTechPost RSS",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.2,
+      "position": [
+        496,
+        576
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "numberInputs": 3
+      },
+      "id": "merge-feeds",
+      "name": "Merge Feed Items",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        720,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = Date.now();\nconst maxAgeMs = 1000 * 60 * 60 * 72;\n\nfunction hostnameFromUrl(value) {\n  try {\n    return new URL(value).hostname.replace(/^www\\./, '');\n  } catch {\n    return 'Unknown Source';\n  }\n}\n\nfunction cleanText(value, max = 500) {\n  return String(value ?? '')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim()\n    .slice(0, max);\n}\n\nconst output = [];\nfor (const item of $input.all().map((entry) => entry.json)) {\n  if (item.error) continue;\n\n  const link = String(item.link || item.guid || item.id || '').trim();\n  const title = cleanText(item.title, 200);\n  const excerpt = cleanText(item.contentSnippet || item.content || item.summary || item.description || '', 600);\n  const published = item.isoDate || item.pubDate || item.published || item.created || '';\n  const publishedTs = published ? Date.parse(published) : NaN;\n  const source = cleanText(item.creator || item.feedTitle || hostnameFromUrl(link), 80) || 'Unknown Source';\n  const publishedAt = Number.isNaN(publishedTs) ? '' : new Date(publishedTs).toISOString();\n\n  if (!title || !link) continue;\n  if (title.length < 20) continue;\n  if (excerpt.length < 40 && title.length < 45) continue;\n  if (publishedAt && Date.parse(publishedAt) < now - maxAgeMs) continue;\n\n  output.push({\n    json: {\n      title,\n      link,\n      excerpt,\n      published_at: publishedAt,\n      source,\n      age_hours: Number.isNaN(publishedTs) ? 999 : Math.max(0, Math.round((now - publishedTs) / 36e5)),\n    },\n  });\n}\n\nreturn output;"
+      },
+      "id": "normalize-articles",
+      "name": "Normalize Articles",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        944,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const articles = $input.all().map((item) => item.json);\n\nfunction normalizeTitle(value) {\n  return String(value || '')\n    .toLowerCase()\n    .replace(/[^a-z0-9\\s]/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction canonicalLink(value) {\n  try {\n    const url = new URL(String(value || '').trim());\n    url.hash = '';\n    const keys = [];\n    url.searchParams.forEach((_, key) => {\n      if (key.toLowerCase().startsWith('utm_')) keys.push(key);\n    });\n    for (const key of keys) url.searchParams.delete(key);\n    return url.toString();\n  } catch {\n    return String(value || '').trim();\n  }\n}\n\nfunction keywordScore(article) {\n  const haystack = `${article.title} ${article.excerpt}`.toLowerCase();\n  const keywords = ['ai', 'artificial intelligence', 'llm', 'agent', 'model', 'openai', 'anthropic', 'google', 'meta', 'microsoft', 'nvidia', 'research'];\n  let score = 0;\n  for (const keyword of keywords) {\n    if (haystack.includes(keyword)) score += 2;\n  }\n  return score;\n}\n\nconst unique = [];\nconst seen = new Set();\nfor (const article of articles) {\n  const titleKey = normalizeTitle(article.title);\n  const linkKey = canonicalLink(article.link);\n  const dedupeKey = `${titleKey}::${linkKey}`;\n  if (!titleKey || !linkKey || seen.has(dedupeKey) || seen.has(titleKey) || seen.has(linkKey)) continue;\n  seen.add(dedupeKey);\n  seen.add(titleKey);\n  seen.add(linkKey);\n\n  const uniqueArticle = {\n    title: article.title,\n    link: article.link,\n    excerpt: article.excerpt,\n    published_at: article.published_at,\n    source: article.source,\n    age_hours: article.age_hours,\n    canonical_link: linkKey,\n  };\n  unique.push(uniqueArticle);\n}\n\nconst scored = [];\nfor (const article of unique) {\n  const recencyBoost = article.age_hours <= 12 ? 10 : article.age_hours <= 24 ? 7 : article.age_hours <= 48 ? 4 : 1;\n  const substanceBoost = Math.min(6, Math.floor((article.excerpt || '').length / 90));\n  scored.push({\n    title: article.title,\n    link: article.link,\n    excerpt: article.excerpt,\n    published_at: article.published_at,\n    source: article.source,\n    age_hours: article.age_hours,\n    canonical_link: article.canonical_link,\n    score: recencyBoost + substanceBoost + keywordScore(article),\n  });\n}\n\nscored.sort((a, b) => b.score - a.score || a.age_hours - b.age_hours);\n\nconst topStories = [];\nconst sourceCounts = new Map();\nfor (const article of scored) {\n  const count = sourceCounts.get(article.source) || 0;\n  if (count >= 2) continue;\n  sourceCounts.set(article.source, count + 1);\n  topStories.push({\n    title: article.title,\n    source: article.source,\n    excerpt: article.excerpt,\n    published_at: article.published_at,\n    link: article.link,\n    canonical_link: article.canonical_link,\n    score: article.score,\n  });\n  if (topStories.length >= 5) break;\n}\n\nconst runDate = new Date().toISOString().slice(0, 10);\nconst blobParts = [];\nfor (let index = 0; index < topStories.length; index++) {\n  const story = topStories[index];\n  blobParts.push([\n    `${index + 1}. ${story.title}`,\n    `Source: ${story.source}`,\n    `Published: ${story.published_at || 'Unknown'}`,\n    `Excerpt: ${story.excerpt || 'No excerpt provided.'}`,\n    `Link: ${story.canonical_link}`,\n  ].join('\\n'));\n}\n\nconst result = {\n  run_date: runDate,\n  story_count: topStories.length,\n  stories: topStories,\n  story_blob: blobParts.join('\\n\\n'),\n};\n\nreturn [{ json: result }];"
+      },
+      "id": "rank-dedupe",
+      "name": "Rank and Deduplicate Stories",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1168,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "stories-found",
+              "leftValue": "={{ Number($json.story_count || 0) > 0 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-has-stories",
+      "name": "Has Strong Stories?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1392,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "digest-date",
+              "name": "run_date",
+              "value": "={{ $json.run_date }}",
+              "type": "string"
+            },
+            {
+              "id": "digest-stories",
+              "name": "stories",
+              "value": "={{ JSON.stringify($json.stories) }}",
+              "type": "string"
+            },
+            {
+              "id": "digest-prompt",
+              "name": "digest_prompt",
+              "value": "=Create a compact daily AI news digest for Telegram for {{$json.run_date}}.\\n\\nYou will receive up to 5 already-ranked stories in JSON. Use only these stories.\\n\\nRequirements:\\n- Return valid JSON only.\\n- Keep the intro to one line.\\n- For each story, write a short summary of at most 2 sentences.\\n- Add one concise why_it_matters line.\\n- Preserve the original title, source, and link exactly as provided.\\n- Keep the response mobile-friendly and concise.\\n\\nReturn this exact JSON shape:\\n{\\n  \\\"intro\\\": \\\"\\\",\\n  \\\"stories\\\": [\\n    {\\n      \\\"title\\\": \\\"\\\",\\n      \\\"source\\\": \\\"\\\",\\n      \\\"summary\\\": \\\"\\\",\\n      \\\"why_it_matters\\\": \\\"\\\",\\n      \\\"link\\\": \\\"\\\"\\n    }\\n  ]\\n}\\n\\nStories JSON:\\n{{$json.stories.toJsonString()}}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "prepare-prompt",
+      "name": "Prepare Digest Prompt",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1616,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.digest_prompt }}",
+        "batching": {}
+      },
+      "id": "generate-digest",
+      "name": "Generate Digest with AI",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        1840,
+        128
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": "groq/compound-mini",
+        "options": {}
+      },
+      "id": "groq-model",
+      "name": "Groq Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        1904,
+        336
+      ],
+      "credentials": {
+        "groqApi": {
+          "id": "B7kYxI7HYdxTgemI",
+          "name": "Groq account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const source = $input.first().json;\nconst originalStories = Array.isArray(source.stories) ? source.stories : [];\nconst raw = String(source.text ?? source.output ?? source.response ?? source.message ?? '').trim();\n\nfunction escapeHtml(value) {\n  return String(value ?? '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\n}\n\nfunction truncate(value, max) {\n  const text = String(value ?? '').replace(/\\s+/g, ' ').trim();\n  if (text.length <= max) return text;\n  return `${text.slice(0, Math.max(0, max - 1)).trim()}…`;\n}\n\nfunction extractJson(text) {\n  if (!text) return null;\n  const fenced = text.match(/```(?:json)?\\s*([\\s\\S]*?)\\s*```/i);\n  const jsonCandidate = fenced?.[1]?.trim() || text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1).trim();\n  if (!jsonCandidate || !jsonCandidate.startsWith('{')) return null;\n  return JSON.parse(jsonCandidate);\n}\n\nfunction makeStory(baseStory, aiStory, index) {\n  return {\n    title: String(aiStory?.title || baseStory?.title || `Story ${index + 1}`).trim(),\n    source: String(aiStory?.source || baseStory?.source || 'Unknown Source').trim(),\n    summary: truncate(aiStory?.summary || baseStory?.excerpt || 'No summary available.', 220),\n    why_it_matters: truncate(aiStory?.why_it_matters || 'This is one of the more relevant AI updates from today.', 160),\n    link: String(aiStory?.link || baseStory?.canonical_link || baseStory?.link || '').trim(),\n  };\n}\n\nlet parsed = null;\ntry {\n  parsed = extractJson(raw);\n} catch {\n  parsed = null;\n}\n\nconst formattedStories = [];\nif (Array.isArray(parsed?.stories) && parsed.stories.length) {\n  for (let index = 0; index < parsed.stories.length && index < 5; index++) {\n    formattedStories.push(makeStory(originalStories[index], parsed.stories[index], index));\n  }\n} else {\n  for (let index = 0; index < originalStories.length && index < 5; index++) {\n    formattedStories.push(makeStory(originalStories[index], null, index));\n  }\n}\n\nconst intro = truncate(parsed?.intro || 'Here are the strongest AI updates worth your attention today.', 180);\nconst headerDate = escapeHtml(source.run_date || new Date().toISOString().slice(0, 10));\nconst bodyParts = [];\nfor (let index = 0; index < formattedStories.length; index++) {\n  const story = formattedStories[index];\n  bodyParts.push([\n    `<b>${index + 1}. ${escapeHtml(truncate(story.title, 110))}</b>`,\n    `<i>${escapeHtml(truncate(story.source, 60))}</i>`,\n    `${escapeHtml(story.summary)}`,\n    `<b>Why it matters:</b> ${escapeHtml(story.why_it_matters)}`,\n    `${escapeHtml(story.link)}`,\n  ].join('\\n'));\n}\n\nconst message = (`<b>AI News Digest | ${headerDate}</b>\\n${escapeHtml(intro)}\\n\\n${bodyParts.join('\\n\\n')}`).slice(0, 3900);\nconst result = {\n  run_date: source.run_date,\n  telegram_message: message,\n  story_count: formattedStories.length,\n  ai_model_used: 'groq/compound-mini',\n};\n\nreturn [{ json: result }];"
+      },
+      "id": "parse-digest",
+      "name": "Parse AI Digest and Format Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2192,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "6245038564",
+        "text": "={{ $json.telegram_message }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "send-digest",
+      "name": "Send Telegram Digest",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2416,
+        240
+      ],
+      "webhookId": "eb501a81-6d71-4831-b043-29ab114c7d76",
+      "credentials": {
+        "telegramApi": {
+          "id": "u33hHDL7VeyYJrmf",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "fallback-message",
+              "name": "telegram_message",
+              "value": "=<b>AI News Digest | {{$json.run_date}}</b>\\nNo strong AI updates were found today across the configured feeds.",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "prepare-fallback",
+      "name": "Prepare Fallback Telegram Message",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1616,
+        528
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "=6245038564",
+        "text": "={{ $json.telegram_message }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "send-fallback",
+      "name": "Send Telegram Fallback",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1904,
+        528
+      ],
+      "webhookId": "84e113c6-68c0-456a-a092-2cbc88c5f549",
+      "credentials": {
+        "telegramApi": {
+          "id": "u33hHDL7VeyYJrmf",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Daily Schedule": {
+      "main": [
+        [
+          {
+            "node": "Read OpenAI News RSS",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Read VentureBeat AI RSS",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Read MarkTechPost RSS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read OpenAI News RSS": {
+      "main": [
+        [
+          {
+            "node": "Merge Feed Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read VentureBeat AI RSS": {
+      "main": [
+        [
+          {
+            "node": "Merge Feed Items",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Read MarkTechPost RSS": {
+      "main": [
+        [
+          {
+            "node": "Merge Feed Items",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Merge Feed Items": {
+      "main": [
+        [
+          {
+            "node": "Normalize Articles",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Articles": {
+      "main": [
+        [
+          {
+            "node": "Rank and Deduplicate Stories",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rank and Deduplicate Stories": {
+      "main": [
+        [
+          {
+            "node": "Has Strong Stories?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Strong Stories?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Digest Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Fallback Telegram Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Digest Prompt": {
+      "main": [
+        [
+          {
+            "node": "Generate Digest with AI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Generate Digest with AI",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Digest with AI": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Digest and Format Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Digest and Format Telegram": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Fallback Telegram Message": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true
+  },
+  "versionId": "7a137617-1bb3-44bf-8f66-ba847941aeec",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "0367dc4a6718eb63692d4eeb2a6884ae8719300f465253bd9a2c55793ce4e459"
+  },
+  "id": "XbhfWXYXMfAJXnzd",
+  "tags": []
+}
